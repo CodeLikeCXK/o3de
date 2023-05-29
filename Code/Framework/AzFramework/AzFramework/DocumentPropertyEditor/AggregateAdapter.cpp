@@ -159,8 +159,8 @@ namespace AZ::DocumentPropertyEditor
                     (void)rowParentNode;
                     /* TODO:
                     - see if the entry for rowParentNode at adapterIndex still is SameRow (NB: if adapterIndex is 0, you need to use
-                      a different GetComparisonRow), if not, remove it and place it where it actually goes. If yes, update the node's "values
-                      differ" status
+                      a different GetComparisonRow), if not, remove it and place it where it actually goes. If yes, update the node's
+                    "values differ" status
                     - Suggestion: it's almost certainly simpler to remove this parent node and repopulate to see if it ends up in the same
                       bucket, but need to track exactly what's been updated since last frame for patching purposes */
                 }
@@ -233,7 +233,8 @@ namespace AZ::DocumentPropertyEditor
                                 }
                                 else
                                 {
-                                    // TODO: no longer the same row, check for a matching sibling, and if there isn't one, split off a new node
+                                    // TODO: no longer the same row, check for a matching sibling,
+                                    // and if there isn't one, split off a new node
                                     AZ_Assert(0, "replace operation morphing node is not supported yet!");
                                 }
                             }
@@ -250,18 +251,44 @@ namespace AZ::DocumentPropertyEditor
                 else
                 {
                     // TODO: handle row being replaced
+                    AZ_Assert(0, "AggregateAdapter: row replace operation is not supported yet!");
                 }
             }
             else if (operationIterator->GetType() == AZ::Dom::PatchOperation::Type::Add)
             {
-                // TODO: handle new nodes being added
+                auto destinationPath = operationIterator->GetDestinationPath();
+                auto lastPathEntry = destinationPath.Back();
+                destinationPath.Pop();
+                auto parentNode = GetNodeAtAdapterPath(adapterIndex, destinationPath);
+                AZ_Assert(parentNode, "can't find node to add to!");
+                if (parentNode)
+                {
+                    if (IsRow(operationIterator->GetValue()))
+                    {
+                        // adding a full row
+                        AZ_Assert(lastPathEntry.IsIndex(), "new addition is a row, it must be addressed by index!");
+                        auto childIndex = lastPathEntry.GetIndex();
+                        auto* aggregateNode = AddChildRow(adapterIndex, parentNode, operationIterator->GetValue(), childIndex);
+                        if (aggregateNode && aggregateNode->EntryCount() == m_adapters.size())
+                        {
+                            // the aggregate node that this add affected is now complete
+                            NotifyContentsChanged(
+                                { Dom::PatchOperation::AddOperation(GetPathForNode(aggregateNode), GetValueHierarchyForNode(aggregateNode)) });
+                        }
+                    }
+                    else
+                    {
+                        // not a full row - see if adding this child causes its parent to no longer match its other entries
+                        AZ_Assert(0, "addition of non-row is not yet supported!");
+                    }
+                }
             }
         }
 
         /* TODO: adds or removes cause all subsequent entries to change index. Update m_pathIndexToChildMaps of parent *and* m_pathEntries
-           of child. Note! We need to only change out column children when swapping "values differ" state, so that we don't have to cull and re-add all
-           row children <apm> it's possible / likely that a node may be removed then added in very quick succession, as more than one
-           adapter adds or removes children */
+           of child. Note! We need to only change out column children when swapping "values differ" state, so that we don't have to cull and
+           re-add all row children. It's possible / likely that a node may be removed then added in very quick succession, as more than
+           one adapter adds or removes children */
     }
 
     void RowAggregateAdapter::HandleDomMessage(
@@ -439,11 +466,88 @@ namespace AZ::DocumentPropertyEditor
         return Dom::Value();
     }
 
+    Dom::Value RowAggregateAdapter::GetValueForNode(AggregateNode* aggregateNode)
+    {
+        return (
+            aggregateNode->m_allEntriesMatch || !m_generateDiffRows ? GenerateAggregateRow(aggregateNode)
+                                                                    : GenerateValuesDifferRow(aggregateNode));
+    }
+
+    Dom::Value RowAggregateAdapter::GetValueHierarchyForNode(AggregateNode* aggregateNode)
+    {
+        Dom::Value returnValue;
+
+        // only create a value if this node is represented by all member adapters
+        if (aggregateNode && aggregateNode->EntryCount() == m_adapters.size())
+        {
+            // create a row value for this node
+            returnValue = Dom::Value::CreateNode(Nodes::Row::Name);
+
+            /* add all row children first (before any labels or PropertyHandlers in this row),
+                so that functions like GetPathForNode can make simplifying assumptions */
+            for (auto& currChild : aggregateNode->m_childRows)
+            {
+                Dom::Value childValue = GetValueHierarchyForNode(currChild.get());
+
+                if (!childValue.IsNull())
+                {
+                    returnValue.ArrayPushBack(childValue);
+                }
+            }
+            // row children have been added, now add the actual label/PropertyEditor children
+            auto childlessRow = GetValueForNode(aggregateNode);
+            if (!childlessRow.IsArrayEmpty())
+            {
+                returnValue.ArrayReserve(returnValue.ArraySize() + childlessRow.ArraySize());
+                AZStd::move(childlessRow.MutableArrayBegin(), childlessRow.MutableArrayEnd(), AZStd::back_inserter(returnValue.GetMutableArray()));
+            }
+        }
+        return returnValue;
+    }
+
     void RowAggregateAdapter::PopulateNodesForAdapter(size_t adapterIndex)
     {
         auto sourceAdapter = m_adapters[adapterIndex]->adapter;
         const auto& sourceContents = sourceAdapter->GetContents();
         PopulateChildren(adapterIndex, sourceContents, m_rootNode.get());
+    }
+
+    RowAggregateAdapter::AggregateNode* RowAggregateAdapter::AddChildRow(
+        size_t adapterIndex, AggregateNode* parentNode, const Dom::Value& childValue, size_t childIndex)
+    {
+        AggregateNode* addedToNode = nullptr;
+
+        // check each existing child to see if we belong there.
+        for (auto matchIter = parentNode->m_childRows.begin(), endIter = parentNode->m_childRows.end();
+             !addedToNode && matchIter != endIter;
+             ++matchIter)
+        {
+            AggregateNode* possibleMatch = matchIter->get();
+
+            // make sure there isn't already an entry for this adapter. This can happen in
+            // edge cases where multiple rows can match, like in multi-sets
+            if (!possibleMatch->HasEntryForAdapter(adapterIndex))
+            {
+                auto comparisonRow = GetComparisonRow(possibleMatch);
+                if (SameRow(childValue, comparisonRow))
+                {
+                    const bool allEntriesMatch = possibleMatch->m_allEntriesMatch && ValuesMatch(childValue, comparisonRow);
+                    possibleMatch->AddEntry(adapterIndex, childIndex, allEntriesMatch);
+                    PopulateChildren(adapterIndex, childValue, possibleMatch);
+                    addedToNode = possibleMatch;
+                }
+            }
+        }
+        if (!addedToNode)
+        {
+            // didn't find an existing child to own us, add a new one and attach to it
+            auto& newNode = parentNode->m_childRows.emplace_back(AZStd::make_unique<AggregateNode>());
+            newNode->m_parent = parentNode;
+            newNode->AddEntry(adapterIndex, childIndex, true);
+            PopulateChildren(adapterIndex, childValue, newNode.get());
+            addedToNode = newNode.get();
+        }
+        return addedToNode;
     }
 
     void RowAggregateAdapter::PopulateChildren(size_t adapterIndex, const Dom::Value& parentValue, AggregateNode* parentNode)
@@ -453,39 +557,11 @@ namespace AZ::DocumentPropertyEditor
         for (size_t childIndex = 0; childIndex < numChildren; ++childIndex)
         {
             const auto& childValue = parentValue[childIndex];
+
+            // the RowAggregateAdapter groups nodes by row, so we ignore non-child rows here
             if (IsRow(childValue))
             {
-                AggregateNode* addedToNode = nullptr;
-
-                // check each existing child to see if we belong there.
-                for (auto matchIter = parentNode->m_childRows.begin(), endIter = parentNode->m_childRows.end();
-                     !addedToNode && matchIter != endIter;
-                     ++matchIter)
-                {
-                    AggregateNode* possibleMatch = matchIter->get();
-
-                    // make sure there isn't already an entry for this adapter. This can happen in
-                    // edge cases where multiple rows can match, like in multi-sets
-                    if (!possibleMatch->HasEntryForAdapter(adapterIndex))
-                    {
-                        auto comparisonRow = GetComparisonRow(possibleMatch);
-                        if (SameRow(childValue, comparisonRow))
-                        {
-                            const bool allEntriesMatch = possibleMatch->m_allEntriesMatch && ValuesMatch(childValue, comparisonRow);
-                            possibleMatch->AddEntry(adapterIndex, childIndex, allEntriesMatch);
-                            PopulateChildren(adapterIndex, childValue, possibleMatch);
-                            addedToNode = possibleMatch;
-                        }
-                    }
-                }
-                if (!addedToNode)
-                {
-                    // didn't find an existing child to own us, add a new one and attach to it
-                    auto& newNode = parentNode->m_childRows.emplace_back(AZStd::make_unique<AggregateNode>());
-                    newNode->m_parent = parentNode;
-                    newNode->AddEntry(adapterIndex, childIndex, true);
-                    PopulateChildren(adapterIndex, childValue, newNode.get());
-                }
+                AddChildRow(adapterIndex, parentNode, childValue, childIndex);
             }
         }
     }
@@ -495,37 +571,17 @@ namespace AZ::DocumentPropertyEditor
         m_builder.BeginAdapter();
         m_builder.EndAdapter();
         Dom::Value contents = m_builder.FinishAndTakeResult();
-        const size_t numAdapters = m_adapters.size();
-        auto AddChildrenToValue = [=](AggregateNode* parentNode, Dom::Value& value, auto&& AddChildrenToValue) -> void
+
+        // root node is not a row, so cannot generate a value directly. Instead, iterate its children for values
+        for (auto& topLevelRow : m_rootNode->m_childRows)
         {
-            for (auto& currChild : parentNode->m_childRows)
+            Dom::Value childValue = GetValueHierarchyForNode(topLevelRow.get());
+            if (!childValue.IsNull())
             {
-                if (currChild->EntryCount() == numAdapters)
-                {
-                    /* add all row children first (before any labels or PropertyHandlers in this row),
-                    so that functions like GetPathForNode can make simplifying assumptions */
-                    auto aggregateRow = Dom::Value::CreateNode(Nodes::Row::Name);
-                    AddChildrenToValue(currChild.get(), aggregateRow, AddChildrenToValue);
-
-                    // row children have been added, now add the actual label/PropertyEditor children
-                    auto generatedValue =
-                        (currChild->m_allEntriesMatch || !m_generateDiffRows ? GenerateAggregateRow(currChild.get())
-                                                                             : GenerateValuesDifferRow(currChild.get()));
-
-                    // move all the non-row items that were generated for the standalone row to this new full row
-                    auto& aggregateRowArray = aggregateRow.GetMutableArray();
-                    auto& generatedValueArray = generatedValue.GetArray();
-                    aggregateRowArray.insert(
-                        aggregateRowArray.end(),
-                        AZStd::make_move_iterator(generatedValueArray.begin()),
-                        AZStd::make_move_iterator(generatedValueArray.end()));
-
-                    value.ArrayPushBack(aggregateRow);
-                }
+                contents.ArrayPushBack(childValue);
             }
-        };
+        }
 
-        AddChildrenToValue(m_rootNode.get(), contents, AddChildrenToValue);
         return contents;
     }
 
@@ -544,44 +600,60 @@ namespace AZ::DocumentPropertyEditor
             AZ_Assert(messageNode, "can't find node for given AdapterMessage!");
 
             // it's a forwarded message, we need to look up the original handler for each adapter and call them individually
-            AZ::Dom::Value retval;
             for (size_t adapterIndex = 0, numAdapters = m_adapters.size(); adapterIndex < numAdapters; ++adapterIndex)
             {
                 auto attributePath = messageNode->GetPathForAdapter(adapterIndex) / originalColumn / message.m_messageName;
                 auto attributeValue = m_adapters[adapterIndex]->adapter->GetContents()[attributePath];
                 AZ_Assert(!attributeValue.IsNull(), "function attribute should exist for each adapter!");
-                auto adapterFunction = BoundAdapterMessage::TryMarshalFromDom(attributeValue);
 
-                if (adapterFunction.has_value())
+                auto invokeDomValueFunction = [&message](const Dom::Value& functionValue, auto&& invokeDomValueFunction) -> Dom::Value
                 {
-                    // it's a bound adapter message, just call it, hooray!
-                    messageResult = adapterFunction.value()(message.m_messageParameters);
-                }
-                else if (attributeValue.IsObject())
-                {
-                    // it's an object, it should be a callable attribute
-                    auto typeField = attributeValue.FindMember(AZ::Attribute::GetTypeField());
-                    if (typeField != attributeValue.MemberEnd() && typeField->second.IsString() &&
-                        typeField->second.GetString() == Attribute::GetTypeName())
+                    Dom::Value result;
+                    auto adapterFunction = BoundAdapterMessage::TryMarshalFromDom(functionValue);
+
+                    if (adapterFunction.has_value())
                     {
-                        // last chance! Check if it's an invokable Attribute
-                        void* instance = AZ::Dom::Utils::ValueToTypeUnsafe<void*>(attributeValue[AZ::Attribute::GetInstanceField()]);
-                        AZ::Attribute* attribute =
-                            AZ::Dom::Utils::ValueToTypeUnsafe<AZ::Attribute*>(attributeValue[AZ::Attribute::GetAttributeField()]);
-
-                        const bool canInvoke = attribute->IsInvokable() && attribute->CanDomInvoke(message.m_messageParameters);
-                        AZ_Assert(canInvoke, "message attribute is not invokable!");
-                        if (canInvoke)
+                        // it's a bound adapter message, just call it, hooray!
+                        result = adapterFunction.value()(message.m_messageParameters);
+                    }
+                    else if (functionValue.IsObject())
+                    {
+                        // it's an object, it should be a callable attribute
+                        auto typeField = functionValue.FindMember(AZ::Attribute::GetTypeField());
+                        if (typeField != functionValue.MemberEnd() && typeField->second.IsString() &&
+                            typeField->second.GetString() == Attribute::GetTypeName())
                         {
-                            messageResult = attribute->DomInvoke(instance, message.m_messageParameters);
+                            // last chance! Check if it's an invokable Attribute
+                            void* instance = AZ::Dom::Utils::ValueToTypeUnsafe<void*>(functionValue[AZ::Attribute::GetInstanceField()]);
+                            AZ::Attribute* attribute =
+                                AZ::Dom::Utils::ValueToTypeUnsafe<AZ::Attribute*>(functionValue[AZ::Attribute::GetAttributeField()]);
+
+                            const bool canInvoke = attribute->IsInvokable() && attribute->CanDomInvoke(message.m_messageParameters);
+                            AZ_Assert(canInvoke, "message attribute is not invokable!");
+                            if (canInvoke)
+                            {
+                                result = attribute->DomInvoke(instance, message.m_messageParameters);
+                            }
                         }
                     }
-                }
-                else
-                {
-                    // it's not a function object, it's most likely a pass-through Value, so pass it through
-                    messageResult = attributeValue;
-                }
+                    else if (functionValue.IsArray())
+                    {
+                        for (auto arrayIter = functionValue.ArrayBegin(), endIter = functionValue.ArrayEnd(); arrayIter != endIter;
+                             ++arrayIter)
+                        {
+                            // Note: currently last call in the array wins. This could be parameterized in the future if
+                            // a different result is desired
+                            result = invokeDomValueFunction(*arrayIter, invokeDomValueFunction);
+                        }
+                    }
+                    else
+                    {
+                        // it's not a function object, it's most likely a pass-through Value, so pass it through
+                        result = functionValue;
+                    }
+                    return result;
+                };
+                messageResult = invokeDomValueFunction(attributeValue, invokeDomValueFunction);
             }
         }
         else
@@ -616,7 +688,8 @@ namespace AZ::DocumentPropertyEditor
     {
         return { Nodes::PropertyEditor::OnChanged.GetName(),
                  Nodes::PropertyEditor::ChangeNotify.GetName(),
-                 Nodes::PropertyEditor::RequestTreeUpdate.GetName() };
+                 Nodes::PropertyEditor::RequestTreeUpdate.GetName(),
+                 Nodes::GenericButton::OnActivate.GetName() };
     }
 
     Dom::Value LabeledRowAggregateAdapter::GenerateAggregateRow(AggregateNode* matchingNode)
