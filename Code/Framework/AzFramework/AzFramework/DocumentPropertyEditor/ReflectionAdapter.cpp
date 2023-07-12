@@ -12,6 +12,7 @@
 #include <AzCore/DOM/DomUtils.h>
 #include <AzCore/Settings/SettingsRegistry.h>
 #include <AzCore/std/ranges/ranges_algorithm.h>
+#include <AzFramework/DocumentPropertyEditor/ExpanderSettings.h>
 #include <AzFramework/DocumentPropertyEditor/PropertyEditorNodes.h>
 #include <AzFramework/DocumentPropertyEditor/Reflection/LegacyReflectionBridge.h>
 #include <AzFramework/DocumentPropertyEditor/ReflectionAdapter.h>
@@ -566,7 +567,15 @@ namespace AZ::DocumentPropertyEditor
                 }
 
                 auto parentContainer = AZ::Dom::Utils::ValueToTypeUnsafe<AZ::SerializeContext::IDataContainer*>(*parentContainerAttribute);
-                if (!parentContainer->IsFixedSize())
+
+                bool parentCanBeModified = true;
+                if (auto parentCanBeModifiedValue = attributes.Find(AZ::Reflection::DescriptorAttributes::ParentContainerCanBeModified);
+                    parentCanBeModifiedValue)
+                {
+                    parentCanBeModified = parentCanBeModifiedValue->IsBool() && parentCanBeModifiedValue->GetBool();
+                }
+
+                if (!parentContainer->IsFixedSize() && parentCanBeModified)
                 {
                     m_builder.BeginPropertyEditor<Nodes::ContainerActionButton>();
                     m_builder.Attribute(Nodes::PropertyEditor::SharePriorColumn, true);
@@ -648,24 +657,36 @@ namespace AZ::DocumentPropertyEditor
                     {
                         AZStd::string_view serializedPath = ExtractSerializedPath(attributes);
 
-                        size_t containerSize = container->Size(access.Get());
-                        if (containerSize == 1)
+                        m_adapter->CreateLabel(
+                            &m_builder, labelAttribute->GetString(),
+                            serializedPath);
+
+                        auto valueTextAttribute = attributes.Find(Nodes::Label::ValueText.GetName());
+                        if (valueTextAttribute && !valueTextAttribute->IsNull() && valueTextAttribute->IsString())
                         {
-                            m_adapter->CreateLabel(
-                                &m_builder,
-                                AZStd::string::format("%s (1 element)", labelAttribute->GetString().data()),
-                                serializedPath);
+                            m_adapter->CreateLabel(&m_builder, valueTextAttribute->GetString(), serializedPath);
                         }
                         else
                         {
-                            m_adapter->CreateLabel(
-                                &m_builder,
-                                AZStd::string::format("%s (%zu elements)", labelAttribute->GetString().data(), containerSize),
-                                serializedPath);
+                            size_t containerSize = container->Size(access.Get());
+                            if (containerSize == 1)
+                            {
+                                m_adapter->CreateLabel(&m_builder, AZStd::string::format("1 element"), serializedPath);
+                            }
+                            else
+                            {
+                                m_adapter->CreateLabel(&m_builder, AZStd::string::format("%zu elements", containerSize), serializedPath);
+                            }
                         }
                     }
 
-                    if (!container->IsFixedSize())
+                    bool canBeModified = true;
+                    if (auto canBeModifiedValue = attributes.Find(Nodes::Container::ContainerCanBeModified.GetName()); canBeModifiedValue)
+                    {
+                        canBeModified = canBeModifiedValue->IsBool() && canBeModifiedValue->GetBool();
+                    }
+
+                    if (canBeModified && !container->IsFixedSize())
                     {
                         bool isDisabled = false;
                         if (auto disabledValue = attributes.Find(Nodes::NodeWithVisiblityControl::Disabled.GetName()); disabledValue)
@@ -893,6 +914,12 @@ namespace AZ::DocumentPropertyEditor
     void ReflectionAdapter::UpdateDomContents(const PropertyChangeInfo& propertyChangeInfo)
     {
         NotifyContentsChanged({ Dom::PatchOperation::ReplaceOperation(propertyChangeInfo.path / "Value", propertyChangeInfo.newValue) });
+    }
+
+    ExpanderSettings* ReflectionAdapter::CreateExpanderSettings(
+        DocumentAdapter* referenceAdapter, const AZStd::string& settingsRegistryKey, const AZStd::string& propertyEditorName)
+    {
+        return new LabeledRowDPEExpanderSettings(referenceAdapter, settingsRegistryKey, propertyEditorName);
     }
 
     Dom::Value ReflectionAdapter::GenerateContents()
