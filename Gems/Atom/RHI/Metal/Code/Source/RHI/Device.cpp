@@ -136,6 +136,7 @@ namespace AZ
 
         void Device::EndFrameInternal()
         {
+            m_bindlessArgumentBuffer.GarbageCollect();
             m_argumentBufferConstantsAllocator.GarbageCollect();
             m_argumentBufferAllocator.GarbageCollect();
             m_commandQueueContext.End();
@@ -395,8 +396,8 @@ namespace AZ
             m_limits.m_minConstantBufferViewOffset = Alignment::Constant;
             m_limits.m_maxConstantBufferSize = m_metalDevice.maxBufferLength;
             m_limits.m_maxBufferSize = m_metalDevice.maxBufferLength;
-            
-            AZ_Assert(m_metalDevice.argumentBuffersSupport, "Atom needs Argument buffer support to run");
+ 
+            AZ_Assert(m_metalDevice.argumentBuffersSupport >= MTLArgumentBuffersTier1, "Atom needs Argument buffer support to run");
         }
 
         CommandList* Device::AcquireCommandList(RHI::HardwareQueueClass hardwareQueueClass)
