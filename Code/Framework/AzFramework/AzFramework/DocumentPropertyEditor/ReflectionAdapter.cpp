@@ -7,9 +7,11 @@
  */
 
 #include <AzCore/Component/ComponentApplicationBus.h>
+#include <AzCore/Console/IConsole.h>
 #include <AzCore/DOM/Backends/JSON/JsonSerializationUtils.h>
 #include <AzCore/DOM/DomPrefixTree.h>
 #include <AzCore/DOM/DomUtils.h>
+#include <AzCore/Serialization/PointerObject.h>
 #include <AzCore/Settings/SettingsRegistry.h>
 #include <AzCore/std/ranges/ranges_algorithm.h>
 #include <AzFramework/DocumentPropertyEditor/ExpanderSettings.h>
@@ -25,9 +27,8 @@ namespace AZ::DocumentPropertyEditor
         ReflectionAdapter* m_adapter;
         AdapterBuilder m_builder;
         // Look-up table of onChanged callbacks for handling property changes
-        AZ::Dom::DomPrefixTree<AZStd::function<Dom::Value(const Dom::Value&)>> m_onChangedCallbacks;
-
-        static constexpr AZStd::string_view InspectorOverrideManagementKey = "/O3DE/Preferences/Prefabs/EnableInspectorOverrideManagement";
+        using OnChangedCallbackPrefixTree = AZ::Dom::DomPrefixTree<AZStd::function<Dom::Value(const Dom::Value&)>>;
+        OnChangedCallbackPrefixTree m_onChangedCallbacks;
 
         //! This represents a container or associative container instance and has methods
         //! for interacting with the container.
@@ -46,10 +47,18 @@ namespace AZ::DocumentPropertyEditor
             {
                 AZ_Assert(instance != nullptr, "Instance was nullptr when attempting to create a BoundContainer");
 
-                auto containerValue = attributes.Find(AZ::Reflection::DescriptorAttributes::Container);
-                if (containerValue && !containerValue->IsNull())
+                AZ::Serialize::IDataContainer* container{};
+                if (auto containerValue = attributes.Find(AZ::Reflection::DescriptorAttributes::Container);
+                    containerValue && !containerValue->IsNull())
                 {
-                    auto container = AZ::Dom::Utils::ValueToTypeUnsafe<AZ::SerializeContext::IDataContainer*>(*containerValue);
+                    if (auto containerObject = AZ::Dom::Utils::ValueToType<AZ::PointerObject>(*containerValue);
+                        containerObject && containerObject->m_typeId == azrtti_typeid<AZ::Serialize::IDataContainer>())
+                    {
+                        container = reinterpret_cast<AZ::Serialize::IDataContainer*>(containerObject->m_address);
+                    }
+                }
+                if (container != nullptr)
+                {
                     return AZStd::make_unique<BoundContainer>(container, instance);
                 }
                 return nullptr;
@@ -198,13 +207,25 @@ namespace AZ::DocumentPropertyEditor
             {
                 AZ_Assert(instance != nullptr, "Instance was nullptr when attempting to create a ContainerElement");
 
-                auto parentContainerValue = attributes.Find(AZ::Reflection::DescriptorAttributes::ParentContainer);
-                if (parentContainerValue && !parentContainerValue->IsNull())
+                AZ::Serialize::IDataContainer* parentContainer{};
+                if (auto parentContainerValue = attributes.Find(AZ::Reflection::DescriptorAttributes::ParentContainer);
+                    parentContainerValue && !parentContainerValue->IsNull())
                 {
-                    auto parentContainer = AZ::Dom::Utils::ValueToTypeUnsafe<AZ::SerializeContext::IDataContainer*>(*parentContainerValue);
-
+                    auto parentContainerObject = AZ::Dom::Utils::ValueToType<AZ::PointerObject>(*parentContainerValue);
+                    if (parentContainerObject && parentContainerObject->m_typeId == azrtti_typeid<AZ::Serialize::IDataContainer>())
+                    {
+                        parentContainer = reinterpret_cast<AZ::Serialize::IDataContainer*>(parentContainerObject->m_address);
+                    }
+                }
+                if (parentContainer != nullptr)
+                {
                     auto parentContainerInstanceValue = attributes.Find(AZ::Reflection::DescriptorAttributes::ParentContainerInstance);
-                    auto parentContainerInstance = AZ::Dom::Utils::ValueToTypeUnsafe<void*>(*parentContainerInstanceValue);
+                    void* parentContainerInstance{};
+                    AZStd::optional<AZ::PointerObject> parentContainerInstanceObject = AZ::Dom::Utils::ValueToType<AZ::PointerObject>(*parentContainerInstanceValue);
+                    if (parentContainerInstanceObject.has_value())
+                    {
+                        parentContainerInstance = parentContainerInstanceObject->m_address;
+                    }
 
                     // Check if this element is actually standing in for a direct child of a container. This is used in scenarios like
                     // maps, where the direct children are actually pairs of key/value, but we need to only show the value as an
@@ -212,7 +233,11 @@ namespace AZ::DocumentPropertyEditor
                     auto containerElementOverrideValue = attributes.Find(AZ::Reflection::DescriptorAttributes::ContainerElementOverride);
                     if (containerElementOverrideValue)
                     {
-                        instance = AZ::Dom::Utils::ValueToTypeUnsafe<void*>(*containerElementOverrideValue);
+                        AZStd::optional<AZ::PointerObject> containerElementOverrideObject = AZ::Dom::Utils::ValueToType<AZ::PointerObject>(*containerElementOverrideValue);
+                        if (containerElementOverrideObject.has_value())
+                        {
+                            instance = containerElementOverrideObject->m_address;
+                        }
                     }
 
                     return AZStd::make_unique<ContainerElement>(parentContainer, parentContainerInstance, instance);
@@ -383,7 +408,7 @@ namespace AZ::DocumentPropertyEditor
             {
                 m_builder.Attribute(
                     Nodes::PropertyEditor::ValueHashed,
-                    AZ::Uuid::CreateData(static_cast<AZStd::byte*>(instance), valueSize));
+                    static_cast<AZ::u64>(AZStd::hash<AZ::Uuid>{}((AZ::Uuid::CreateData(static_cast<AZStd::byte*>(instance), valueSize)))));
             }
             m_builder.EndPropertyEditor();
 
@@ -424,19 +449,64 @@ namespace AZ::DocumentPropertyEditor
                 attributes,
                 [valuePointer, valueType, this](const Dom::Value& newValue)
                 {
-                    void* marshalledPointer = AZ::Dom::Utils::TryMarshalValueToPointer(newValue, valueType);
-                    rapidjson::Document serializedValue;
-                    JsonSerialization::Store(serializedValue, serializedValue.GetAllocator(), marshalledPointer, nullptr, valueType);
+                    AZ::JsonSerializationResult::ResultCode resultCode(AZ::JsonSerializationResult::Tasks::ReadField);
+                    // marshal this new value into a pointer for use by the Json serializer if a pointer is being stored
+                    if (auto marshalledPointer = AZ::Dom::Utils::TryMarshalValueToPointer(newValue, valueType); marshalledPointer != nullptr)
+                    {
+                        rapidjson::Document buffer;
+                        JsonSerializerSettings serializeSettings;
+                        JsonDeserializerSettings deserializeSettings;
+                        serializeSettings.m_serializeContext = m_serializeContext;
+                        deserializeSettings.m_serializeContext = m_serializeContext;
 
-                    JsonDeserializerSettings deserializeSettings;
-                    deserializeSettings.m_serializeContext = m_serializeContext;
-                    // now deserialize that value into the original location
-                    JsonSerialization::Load(valuePointer, valueType, serializedValue, deserializeSettings);
+                        // serialize the new value to Json, using the original valuePointer as a reference object to generate a minimal
+                        // diff
+                        resultCode = JsonSerialization::Store(
+                            buffer, buffer.GetAllocator(), marshalledPointer, valuePointer, valueType, serializeSettings);
+
+                        if (resultCode.GetProcessing() == AZ::JsonSerializationResult::Processing::Halted)
+                        {
+                            AZ_Error(
+                                "ReflectionAdapter",
+                                false,
+                                "Storing new property editor value to JSON for copying to instance has failed with error %s",
+                                resultCode.ToString("").c_str());
+                            return newValue;
+                        }
+
+                        // now deserialize that value into the original location
+                        resultCode = JsonSerialization::Load(valuePointer, valueType, buffer, deserializeSettings);
+                        if (resultCode.GetProcessing() == AZ::JsonSerializationResult::Processing::Halted)
+                        {
+                            AZ_Error(
+                                "ReflectionAdapter",
+                                false,
+                                "Loading JSON value containing new property editor into instance has failed with error %s",
+                                resultCode.ToString("").c_str());
+                            return newValue;
+                        }
+
+                    }
+                    else
+                    {
+                        // Otherwise use Json Serialization to copy the Dom Value directly into the valuePointer address
+                        resultCode = AZ::Dom::Utils::LoadViaJsonSerialization(valuePointer, valueType, newValue);
+                        if (resultCode.GetProcessing() == AZ::JsonSerializationResult::Processing::Halted)
+                        {
+                            AZ_Error(
+                                "ReflectionAdapter",
+                                false,
+                                "Loading new DOMValue directly into instance has failed with error %s",
+                                resultCode.ToString("").c_str());
+                            return newValue;
+                        }
+                    }
 
                     AZ::Dom::Value newInstancePointerValue;
-                    auto outputWriter = newInstancePointerValue.GetWriteHandler();
-                    auto convertToAzDomResult =
-                        AZ::Dom::Json::VisitRapidJsonValue(serializedValue, *outputWriter, AZ::Dom::Lifetime::Temporary);
+                    AZ::JsonSerializerSettings storeSettings;
+                    // Defaults must be kept to make sure a complete object is written to the Dom::Value
+                    storeSettings.m_keepDefaults = true;
+                    AZ::Dom::Utils::StoreViaJsonSerialization(valuePointer, nullptr, valueType, newInstancePointerValue, storeSettings);
                     return newInstancePointerValue;
                 },
                 false,
@@ -446,12 +516,10 @@ namespace AZ::DocumentPropertyEditor
         bool IsInspectorOverrideManagementEnabled()
         {
             bool isInspectorOverrideManagementEnabled = false;
-
-            if (auto* registry = AZ::SettingsRegistry::Get())
+            if (auto* console = AZ::Interface<AZ::IConsole>::Get(); console != nullptr)
             {
-                registry->Get(isInspectorOverrideManagementEnabled, InspectorOverrideManagementKey);
+                console->GetCvarValue("ed_enableInspectorOverrideManagement", isInspectorOverrideManagementEnabled);
             }
-
             return isInspectorOverrideManagementEnabled;
         }
 
@@ -551,8 +619,18 @@ namespace AZ::DocumentPropertyEditor
         {
             auto parentContainerAttribute = attributes.Find(AZ::Reflection::DescriptorAttributes::ParentContainer);
             auto parentContainerInstanceAttribute = attributes.Find(AZ::Reflection::DescriptorAttributes::ParentContainerInstance);
-            if (parentContainerAttribute && !parentContainerAttribute->IsNull() &&
-                parentContainerInstanceAttribute && !parentContainerInstanceAttribute->IsNull())
+
+            AZ::Serialize::IDataContainer* parentContainer{};
+            if (parentContainerAttribute && !parentContainerAttribute->IsNull())
+            {
+                if (auto parentContainerObject = AZ::Dom::Utils::ValueToType<AZ::PointerObject>(*parentContainerAttribute);
+                    parentContainerObject && parentContainerObject->m_typeId == azrtti_typeid<AZ::Serialize::IDataContainer>())
+                {
+                    parentContainer = reinterpret_cast<AZ::Serialize::IDataContainer*>(parentContainerObject->m_address);
+                }
+            }
+
+            if (parentContainer != nullptr && parentContainerInstanceAttribute && !parentContainerInstanceAttribute->IsNull())
             {
                 auto containerEntry = m_containers.ValueAtPath(m_builder.GetCurrentPath(), AZ::Dom::PrefixTreeMatch::ExactPath);
                 if (containerEntry)
@@ -565,8 +643,6 @@ namespace AZ::DocumentPropertyEditor
                         m_builder.GetCurrentPath(),
                         ContainerEntry{ nullptr, ContainerElement::CreateContainerElement(instance, attributes) });
                 }
-
-                auto parentContainer = AZ::Dom::Utils::ValueToTypeUnsafe<AZ::SerializeContext::IDataContainer*>(*parentContainerAttribute);
 
                 bool parentCanBeModified = true;
                 if (auto parentCanBeModifiedValue = attributes.Find(AZ::Reflection::DescriptorAttributes::ParentContainerCanBeModified);
@@ -597,6 +673,68 @@ namespace AZ::DocumentPropertyEditor
                     m_builder.AddMessageHandler(m_adapter, Nodes::ContainerActionButton::OnActivate.GetName());
                     m_builder.EndPropertyEditor();
                 }
+            }
+        }
+
+        // Check if the KeyValue attribute is set and if so create a property Editor for that key
+        void CreatePropertyEditorForAssociativeContainerKey(
+            const Reflection::IAttributes& attributes, ReflectionAdapter& adapter, AdapterBuilder& builder)
+        {
+            auto keyValueAttribute = attributes.Find(Nodes::PropertyEditor::KeyValue.GetName());
+            // The element has no KeyValue attribute, so it is not part of an associative container therefore no work needs to be done
+            if (keyValueAttribute == nullptr)
+            {
+                return;
+            }
+
+            if (auto keyValueEntry = AZ::Dom::Utils::ValueToType<AZ::Reflection::LegacyReflectionInternal::KeyEntry>(*keyValueAttribute);
+                keyValueEntry&& keyValueEntry->IsValid())
+            {
+                AZ::PointerObject keyValuePointerObject = keyValueEntry->m_keyInstance;
+
+                const AZStd::vector<AZ::Reflection::LegacyReflectionInternal::AttributeData>& keyAttributes = keyValueEntry->m_keyAttributes;
+
+                // Create a lambda that can return a lambda that searches the keyAttributes vector for a specific attribute
+                auto FindAttributeCreator = [](AZ::Name group, AZ::Name name)
+                {
+                    return [group, name](const AZ::Reflection::LegacyReflectionInternal::AttributeData& attributeData) -> bool
+                    {
+                        return group == attributeData.m_group&& name == attributeData.m_name;
+                    };
+                };
+
+                AZStd::string_view keyPropertyHandlerName;
+                // First try to search for the Handler attribute to see if a custom property handler has been specified
+                if (auto handlerIt = AZStd::find_if(
+                    keyAttributes.begin(),
+                    keyAttributes.end(), FindAttributeCreator(AZ::Name{}, Reflection::DescriptorAttributes::Handler));
+                    handlerIt != keyAttributes.end())
+                {
+                    const AZ::Dom::Value& handler = handlerIt->m_value;
+                    if (handler.IsString())
+                    {
+                        keyPropertyHandlerName = handler.GetString();
+                    }
+                }
+
+                if (keyPropertyHandlerName.empty())
+                {
+                    // If the Key doesn't have a custom property handler
+                    // and it's type is an is represented by an enum use the combo box property handler
+                    if (auto enumTypeHandlerIt = AZStd::find_if(
+                        keyAttributes.begin(),
+                        keyAttributes.end(),
+                        FindAttributeCreator(AZ::Name{}, Nodes::PropertyEditor::EnumType.GetName()));
+                        enumTypeHandlerIt != keyAttributes.end() && !enumTypeHandlerIt->m_value.IsNull())
+                    {
+                        keyPropertyHandlerName = Nodes::ComboBox::Name;
+                    }
+                }
+                builder.BeginPropertyEditor(keyPropertyHandlerName, AZ::Dom::Utils::ValueFromType(keyValuePointerObject));
+                builder.Attribute(Nodes::PropertyEditor::UseMinimumWidth, true);
+                builder.Attribute(Nodes::PropertyEditor::Disabled, true);
+                builder.AddMessageHandler(&adapter, Nodes::PropertyEditor::RequestTreeUpdate);
+                builder.EndPropertyEditor();
             }
         }
 
@@ -665,12 +803,20 @@ namespace AZ::DocumentPropertyEditor
             else
             {
                 auto containerAttribute = attributes.Find(Reflection::DescriptorAttributes::Container);
+
+                AZ::Serialize::IDataContainer* container{};
                 if (containerAttribute && !containerAttribute->IsNull())
+                {
+                    if (auto containerObject = AZ::Dom::Utils::ValueToType<AZ::PointerObject>(*containerAttribute);
+                        containerObject && containerObject->m_typeId == azrtti_typeid<AZ::Serialize::IDataContainer>())
+                    {
+                        container = reinterpret_cast<AZ::Serialize::IDataContainer*>(containerObject->m_address);
+                    }
+                }
+                if (container != nullptr)
                 {
                     m_containers.SetValue(
                         m_builder.GetCurrentPath(), ContainerEntry{ BoundContainer::CreateBoundContainer(access.Get(), attributes) });
-
-                    auto container = AZ::Dom::Utils::ValueToTypeUnsafe<AZ::SerializeContext::IDataContainer*>(*containerAttribute);
 
                     auto labelAttribute = attributes.Find(Reflection::DescriptorAttributes::Label);
                     if (labelAttribute && !labelAttribute->IsNull() && labelAttribute->IsString())
@@ -753,12 +899,9 @@ namespace AZ::DocumentPropertyEditor
                 }
 
                 AZ::Dom::Value instancePointerValue = AZ::Dom::Utils::MarshalTypedPointerToValue(access.Get(), access.GetType());
-                bool hashValue = false;
-                const AZ::Name PointerTypeFieldName = AZ::Dom::Utils::PointerTypeFieldName;
-                if (instancePointerValue.IsOpaqueValue() || instancePointerValue.FindMember(PointerTypeFieldName))
-                {
-                    hashValue = true;
-                }
+                // Only hash an opaque value
+                // A value that is not opaque, but is a pointer will have it's members visited in a recursive call to this method
+                const bool hashValue = instancePointerValue.IsOpaqueValue();
 
                 // The IsInspectorOverrideManagementEnabled() check is only temporary until the inspector override management feature set
                 // is fully developed. Since the original utils funtion is in AzToolsFramework and we can't access it from here, we are
@@ -784,41 +927,59 @@ namespace AZ::DocumentPropertyEditor
                     // this needs to write the value back into the reflected object via Json serialization
                     auto StoreValueIntoPointer = [valuePointer = access.Get(), valueType = access.GetType(), this](const Dom::Value& newValue)
                     {
-                        // marshal this new value into a pointer for use by the Json serializer
-                        auto marshalledPointer = AZ::Dom::Utils::TryMarshalValueToPointer(newValue, valueType);
-
-                        rapidjson::Document buffer;
-                        JsonSerializerSettings serializeSettings;
-                        JsonDeserializerSettings deserializeSettings;
-                        serializeSettings.m_serializeContext = m_serializeContext;
-                        deserializeSettings.m_serializeContext = m_serializeContext;
-
-                        // serialize the new value to Json, using the original valuePointer as a reference object to generate a minimal
-                        // diff
-                        AZ::JsonSerializationResult::ResultCode resultCode = JsonSerialization::Store(
-                            buffer, buffer.GetAllocator(), marshalledPointer, valuePointer, valueType, serializeSettings);
-
-                        if (resultCode.GetProcessing() == AZ::JsonSerializationResult::Processing::Halted)
+                        AZ::JsonSerializationResult::ResultCode resultCode(AZ::JsonSerializationResult::Tasks::ReadField);
+                        // marshal this new value into a pointer for use by the Json serializer if a pointer is being stored
+                        if (auto marshalledPointer = AZ::Dom::Utils::TryMarshalValueToPointer(newValue, valueType); marshalledPointer != nullptr)
                         {
-                            AZ_Error(
-                                "ReflectionAdapter",
-                                false,
-                                "Storing new property editor value to JSON for copying to instance has failed with error %s",
-                                resultCode.ToString("").c_str());
-                            return newValue;
+                            rapidjson::Document buffer;
+                            JsonSerializerSettings serializeSettings;
+                            JsonDeserializerSettings deserializeSettings;
+                            serializeSettings.m_serializeContext = m_serializeContext;
+                            deserializeSettings.m_serializeContext = m_serializeContext;
+
+                            // serialize the new value to Json, using the original valuePointer as a reference object to generate a minimal
+                            // diff
+                            resultCode = JsonSerialization::Store(
+                                buffer, buffer.GetAllocator(), marshalledPointer, valuePointer, valueType, serializeSettings);
+
+                            if (resultCode.GetProcessing() == AZ::JsonSerializationResult::Processing::Halted)
+                            {
+                                AZ_Error(
+                                    "ReflectionAdapter",
+                                    false,
+                                    "Storing new property editor value to JSON for copying to instance has failed with error %s",
+                                    resultCode.ToString("").c_str());
+                                return newValue;
+                            }
+
+                            // now deserialize that value into the original location
+                            resultCode = JsonSerialization::Load(valuePointer, valueType, buffer, deserializeSettings);
+                            if (resultCode.GetProcessing() == AZ::JsonSerializationResult::Processing::Halted)
+                            {
+                                AZ_Error(
+                                    "ReflectionAdapter",
+                                    false,
+                                    "Loading JSON value containing new property editor into instance has failed with error %s",
+                                    resultCode.ToString("").c_str());
+                                return newValue;
+                            }
+
+                        }
+                        else
+                        {
+                            // Otherwise use Json Serialization to copy the Dom Value directly into the valuePointer address
+                            resultCode = AZ::Dom::Utils::LoadViaJsonSerialization(valuePointer, valueType, newValue);
+                            if (resultCode.GetProcessing() == AZ::JsonSerializationResult::Processing::Halted)
+                            {
+                                AZ_Error(
+                                    "ReflectionAdapter",
+                                    false,
+                                    "Loading new DOMValue directly into instance has failed with error %s",
+                                    resultCode.ToString("").c_str());
+                                return newValue;
+                            }
                         }
 
-                        // now deserialize that value into the original location
-                        resultCode = JsonSerialization::Load(valuePointer, valueType, buffer, deserializeSettings);
-                        if (resultCode.GetProcessing() == AZ::JsonSerializationResult::Processing::Halted)
-                        {
-                            AZ_Error(
-                                "ReflectionAdapter",
-                                false,
-                                "Loading JSON value containing new property editor into instance has failed with error %s",
-                                resultCode.ToString("").c_str());
-                            return newValue;
-                        }
 
                         // NB: the returned value for serialized pointer values is instancePointerValue, but since this is passed by
                         // pointer, it will not actually detect a changed dom value. Since we are already writing directly to the DOM
