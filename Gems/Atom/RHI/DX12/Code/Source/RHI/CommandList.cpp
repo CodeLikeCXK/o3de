@@ -676,14 +676,24 @@ namespace AZ
             blasDesc.DestAccelerationStructureData = static_cast<Buffer*>(blasBuffers.m_blasBuffer.get())->GetMemoryView().GetGpuAddress();
             ID3D12GraphicsCommandList4* commandList = static_cast<ID3D12GraphicsCommandList4*>(GetCommandList());
             commandList->BuildRaytracingAccelerationStructure(&blasDesc, 0, nullptr);
+#endif
+        }
 
-            // create an immediate barrier for BLAS completion
-            // this is required since the buffer must be built prior to using it in the TLAS
-            D3D12_RESOURCE_BARRIER barrier;
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-            barrier.UAV.pResource = static_cast<Buffer*>(blasBuffers.m_blasBuffer.get())->GetMemoryView().GetMemory();
-            commandList->ResourceBarrier(1, &barrier);        
+        void CommandList::UpdateBottomLevelAccelerationStructure(const RHI::RayTracingBlas& rayTracingBlas)
+        {
+#ifdef AZ_DX12_DXR_SUPPORT
+            const RayTracingBlas& dx12RayTracingBlas = static_cast<const RayTracingBlas&>(rayTracingBlas);
+            const RayTracingBlas::BlasBuffers& blasBuffers = dx12RayTracingBlas.GetBuffers();
+
+            // create the BLAS
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blasDesc = {};
+            blasDesc.Inputs = dx12RayTracingBlas.GetInputs();
+            blasDesc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+            blasDesc.ScratchAccelerationStructureData = static_cast<Buffer*>(blasBuffers.m_scratchBuffer.get())->GetMemoryView().GetGpuAddress();
+            blasDesc.SourceAccelerationStructureData = static_cast<Buffer*>(blasBuffers.m_blasBuffer.get())->GetMemoryView().GetGpuAddress();
+            blasDesc.DestAccelerationStructureData = blasDesc.SourceAccelerationStructureData;
+            ID3D12GraphicsCommandList4* commandList = static_cast<ID3D12GraphicsCommandList4*>(GetCommandList());
+            commandList->BuildRaytracingAccelerationStructure(&blasDesc, 0, nullptr);
 #endif
         }
 
@@ -699,9 +709,30 @@ namespace AZ
             m_state.m_shadingRateState.Set(rate, combinators);
         }
 
-        void CommandList::BuildTopLevelAccelerationStructure([[maybe_unused]] const RHI::RayTracingTlas& rayTracingTlas)
+        void CommandList::BuildTopLevelAccelerationStructure(
+            const RHI::RayTracingTlas& rayTracingTlas, const AZStd::vector<const RHI::RayTracingBlas*>& changedBlasList)
         {
 #ifdef AZ_DX12_DXR_SUPPORT
+            ID3D12GraphicsCommandList4* commandList = static_cast<ID3D12GraphicsCommandList4*>(GetCommandList());
+            if (!changedBlasList.empty())
+            {
+                // create a barrier for BLAS completion
+                // this is required since all BLAS must be built prior to using it in the TLAS
+                AZStd::vector<D3D12_RESOURCE_BARRIER> barriers;
+                barriers.reserve(changedBlasList.size());
+                for (const auto* blas : changedBlasList)
+                {
+                    const auto dx12RayTracingBlas = static_cast<const RayTracingBlas*>(blas);
+                    const RayTracingBlas::BlasBuffers& blasBuffers = dx12RayTracingBlas->GetBuffers();
+
+                    D3D12_RESOURCE_BARRIER barrier;
+                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    barrier.UAV.pResource = static_cast<Buffer*>(blasBuffers.m_blasBuffer.get())->GetMemoryView().GetMemory();
+                    barriers.push_back(barrier);
+                }
+                commandList->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+            }
             const RayTracingTlas& dx12RayTracingTlas = static_cast<const RayTracingTlas&>(rayTracingTlas);
             const RayTracingTlas::TlasBuffers& tlasBuffers = dx12RayTracingTlas.GetBuffers();
 
@@ -710,8 +741,7 @@ namespace AZ
             tlasDesc.Inputs = dx12RayTracingTlas.GetInputs();
             tlasDesc.ScratchAccelerationStructureData = static_cast<Buffer*>(tlasBuffers.m_scratchBuffer.get())->GetMemoryView().GetGpuAddress();
             tlasDesc.DestAccelerationStructureData = static_cast<Buffer*>(tlasBuffers.m_tlasBuffer.get())->GetMemoryView().GetGpuAddress();
-        
-            ID3D12GraphicsCommandList4* commandList = static_cast<ID3D12GraphicsCommandList4*>(GetCommandList());
+
             commandList->BuildRaytracingAccelerationStructure(&tlasDesc, 0, nullptr);
 #endif
         }

@@ -33,6 +33,7 @@ namespace AZ::Reflection
         const Name ParentContainerCanBeModified =
             Name::FromStringLiteral("ParentContainerCanBeModified", AZ::Interface<AZ::NameDictionary>::Get());
         const Name ContainerElementOverride = Name::FromStringLiteral("ContainerElementOverride", AZ::Interface<AZ::NameDictionary>::Get());
+        const Name ContainerIndex = Name::FromStringLiteral("ContainerIndex", AZ::Interface<AZ::NameDictionary>::Get());
     } // namespace DescriptorAttributes
 
 
@@ -760,8 +761,6 @@ namespace AZ::Reflection
                         {
                             parentData.m_childMappedValueLabelOverride = AZStd::move(*stringKey);
                         }
-                        CacheAttributes();
-                        parentData.m_childKeyEntry.m_keyAttributes = AZStd::move(nodeData.m_cachedAttributes);
 
                         // Do not enumerate the key elements itself
                         // Instead let the mapped type in the else block add a DOM Editor for the key
@@ -1037,11 +1036,29 @@ namespace AZ::Reflection
                 {
                     const StackEntry& parentNode = m_stack[m_stack.size() - 2];
                     AZ::Serialize::IDataContainer* dataContainer = parentNode.m_classData ? parentNode.m_classData->m_container : nullptr;
-                    // Only add a label numeric label for sequence containers
-                    if (dataContainer && dataContainer->IsSequenceContainer())
+                    if (dataContainer)
                     {
-                        labelAttributeBuffer = AZStd::fixed_string<128>::format("[%zu]", parentNode.m_childElementIndex);
-                        return labelAttributeBuffer;
+                        if (auto indexedChildOverride = Find(
+                                AZ::Name(nodeData.m_group),
+                                DocumentPropertyEditor::Nodes::Container::IndexedChildNameLabelOverride.GetName(),
+                                parentNode);
+                            indexedChildOverride)
+                        {
+                            auto retrievedName = DocumentPropertyEditor::Nodes::Container::IndexedChildNameLabelOverride.InvokeOnDomValue(
+                                *indexedChildOverride, parentNode.m_childElementIndex);
+
+                            if (retrievedName.IsSuccess())
+                            {
+                                labelAttributeBuffer = AZStd::fixed_string<128>::format("%s", retrievedName.GetValue().c_str());
+                                return labelAttributeBuffer;
+                            }
+                        }
+                        if (dataContainer->IsSequenceContainer())
+                        {
+                            // Only add a numeric label for sequence containers
+                            labelAttributeBuffer = AZStd::fixed_string<128>::format("[%zu]", parentNode.m_childElementIndex);
+                            return labelAttributeBuffer;
+                        }
                     }
                 }
 
@@ -1152,7 +1169,7 @@ namespace AZ::Reflection
                         if (name == PropertyEditor::Visibility.GetName())
                         {
                             auto visibilityValue = PropertyEditor::Visibility.DomToValue(
-                                PropertyEditor::Visibility.LegacyAttributeToDomValue(instance.m_address, it->second));
+                                PropertyEditor::Visibility.LegacyAttributeToDomValue(instance, it->second));
 
                             if (visibilityValue.has_value())
                             {
@@ -1177,13 +1194,13 @@ namespace AZ::Reflection
                             }
                             else if (
                                 auto visibilityBoolValue =
-                                    VisibilityBoolean.DomToValue(VisibilityBoolean.LegacyAttributeToDomValue(instance.m_address, it->second)))
+                                    VisibilityBoolean.DomToValue(VisibilityBoolean.LegacyAttributeToDomValue(instance, it->second)))
                             {
                                 bool isVisible = visibilityBoolValue.value();
                                 visibility = isVisible ? PropertyVisibility::Show : PropertyVisibility::Hide;
                                 return;
                             }
-                            else if (auto genericVisibility = ReadGenericAttributeToDomValue(instance.m_address, it->second))
+                            else if (auto genericVisibility = ReadGenericAttributeToDomValue(instance, it->second))
                             {
                                 // Fallback to generic read if LegacyAttributeToDomValue fails
                                 visibility = PropertyEditor::Visibility.DomToValue(genericVisibility.value()).value();
@@ -1197,7 +1214,7 @@ namespace AZ::Reflection
                         {
                             nodeData.m_disableEditor |=
                                 PropertyEditor::ReadOnly
-                                    .DomToValue(PropertyEditor::ReadOnly.LegacyAttributeToDomValue(instance.m_address, it->second))
+                                    .DomToValue(PropertyEditor::ReadOnly.LegacyAttributeToDomValue(instance, it->second))
                                     .value_or(nodeData.m_disableEditor);
                         }
 
@@ -1208,7 +1225,7 @@ namespace AZ::Reflection
                         {
                             if (attributeValue.IsNull())
                             {
-                                attributeValue = attributeReader.LegacyAttributeToDomValue(instance.m_address, it->second);
+                                attributeValue = attributeReader.LegacyAttributeToDomValue(instance, it->second);
                             }
                         };
                         propertyEditorSystem->EnumerateRegisteredAttributes(name, readValue);
@@ -1216,7 +1233,7 @@ namespace AZ::Reflection
                         // Fall back on a generic read that handles primitives.
                         if (attributeValue.IsNull())
                         {
-                            attributeValue = ReadGenericAttributeToDomValue(instance.m_address, it->second).value_or(Dom::Value());
+                            attributeValue = ReadGenericAttributeToDomValue(instance, it->second).value_or(Dom::Value());
                         }
 
                         // If we got a valid DOM value, store it.
@@ -1335,7 +1352,7 @@ namespace AZ::Reflection
                                 {
                                     for (auto it = classEditorData->m_attributes.begin(); it != classEditorData->m_attributes.end(); ++it)
                                     {
-                                        checkAttribute(it, nodeData.m_instanceToInvoke, isParentAttribute);
+                                        checkAttribute(it, nodeData.m_instance, isParentAttribute);
                                     }
                                 }
                             }
@@ -1354,10 +1371,10 @@ namespace AZ::Reflection
 
                     if (parentNode.m_classData && parentNode.m_classData->m_container)
                     {
-                        AZ::PointerObject parentDataContainerObject;
-                        parentDataContainerObject.m_address =
+                        auto parentContainerInfo =
                             (parentNode.m_parentContainerInfo ? parentNode.m_parentContainerInfo : parentNode.m_classData->m_container);
-                        parentDataContainerObject.m_typeId = azrtti_typeid<AZ::Serialize::IDataContainer>();
+                        AZ::PointerObject parentDataContainerObject = { parentContainerInfo,
+                                                                        azrtti_typeid<AZ::Serialize::IDataContainer>() };
 
                         nodeData.m_cachedAttributes.push_back(
                             { group, DescriptorAttributes::ParentContainer, Dom::Utils::ValueFromType(parentDataContainerObject) });
@@ -1368,6 +1385,13 @@ namespace AZ::Reflection
                         nodeData.m_cachedAttributes.push_back({ group,
                                                                 DescriptorAttributes::ParentContainerInstance,
                                                                 Dom::Utils::ValueFromType(parentContainerObject) });
+
+                        if (parentContainerInfo->IsSequenceContainer())
+                        {
+                            nodeData.m_cachedAttributes.push_back({ group,
+                                                                    DescriptorAttributes::ContainerIndex,
+                                                                    AZ::Dom::Value(parentNode.m_childElementIndex) });
+                        }
 
                         if (parentNode.m_containerElementOverride.IsValid())
                         {
@@ -1398,11 +1422,34 @@ namespace AZ::Reflection
                     {
                         nodeData.m_cachedAttributes.push_back({ group, DescriptorAttributes::ParentContainer, *parentContainer });
 
-                        auto parentContainerInstance = Find(group, DescriptorAttributes::ParentContainerInstance, parentNode);
-                        if (parentContainerInstance)
+                        const auto inheritedAttributes = { DescriptorAttributes::ParentContainerInstance,
+                                                           DescriptorAttributes::ParentContainerCanBeModified,
+                                                           PropertyEditor::NameLabelOverride.GetName(),
+                                                           AZ::Reflection::DescriptorAttributes::ContainerIndex };
+
+                        for (const auto& attributeName : inheritedAttributes)
                         {
-                            nodeData.m_cachedAttributes.push_back(
-                                { group, DescriptorAttributes::ParentContainerInstance, *parentContainerInstance });
+                            auto inheritedAttribute = Find(group, attributeName, parentNode);
+                            if (inheritedAttribute)
+                            {
+                                auto existingAttribute = Find(group, attributeName, nodeData);
+                                if (existingAttribute)
+                                {
+                                    if (existingAttribute->IsNull() || (existingAttribute->IsObject() && existingAttribute->ObjectEmpty()) || (existingAttribute->IsString() && !existingAttribute->GetStringLength()))
+                                    {
+                                        // overwrite existing empty value
+                                        *existingAttribute = *inheritedAttribute;
+                                    }
+                                    else
+                                    {
+                                        // do nothing! Do not overwrite existing non-empty values
+                                    }
+                                }
+                                else
+                                {
+                                    nodeData.m_cachedAttributes.push_back({ group, attributeName, *inheritedAttribute });
+                                }
+                            }
                         }
                     }
                 }
@@ -1570,7 +1617,20 @@ namespace AZ::Reflection
                 return nullptr;
             }
 
-            const AttributeDataType* Find(Name group, Name name, StackEntry& parentData) const
+            const AttributeDataType* Find(Name group, Name name, const StackEntry& parentData) const
+            {
+                for (auto it = parentData.m_cachedAttributes.cbegin(); it != parentData.m_cachedAttributes.cend(); ++it)
+                {
+                    if (it->m_group == group && it->m_name == name)
+                    {
+                        return &(it->m_value);
+                    }
+                }
+                return nullptr;
+            }
+
+            // non-const Find that can be used to overwrite existing attributes
+            AttributeDataType* Find(Name group, Name name, StackEntry& parentData)
             {
                 for (auto it = parentData.m_cachedAttributes.begin(); it != parentData.m_cachedAttributes.end(); ++it)
                 {
@@ -1637,9 +1697,9 @@ namespace AZ::Reflection
         }
     }
 
-    AZStd::optional<AZ::Dom::Value> ReadGenericAttributeToDomValue(void* instance, AZ::Attribute* attribute)
+    AZStd::optional<AZ::Dom::Value> ReadGenericAttributeToDomValue(AZ::PointerObject instanceObject, AZ::Attribute* attribute)
     {
-        AZ::Dom::Value result = attribute->GetAsDomValue(instance);
+        AZ::Dom::Value result = attribute->GetAsDomValue(instanceObject);
         if (!result.IsNull())
         {
             return result;

@@ -371,15 +371,25 @@ namespace AzToolsFramework
             AZ_Assert(serializeContext, "Serialization context not available");
 
             AZ::TypeId typeId;
+            auto typeIdAttribute = node.FindMember(PropertyEditor::ValueType.GetName());
+            if (typeIdAttribute != node.MemberEnd())
+            {
+                typeId = AZ::Dom::Utils::DomValueToTypeId(typeIdAttribute->second);
+            }
+
             auto value = AZ::DocumentPropertyEditor::Nodes::PropertyEditor::Value.ExtractFromDomNode(node);
-            if (value.has_value())
+            if (value.has_value() && (!value->IsObject() || !value->ObjectEmpty()))
             {
                 if (auto valueToType = AZ::Dom::Utils::ValueToType<WrappedType>(value.value()); valueToType)
                 {
                     m_proxyValue = *valueToType;
-                    typeId = m_proxyClassData.m_typeId;
+
+                    if (typeId.IsNull())
+                    {
+                        typeId = m_proxyClassData.m_typeId;
+                    }
                 }
-                else if (auto valueToPointerObject = AZ::Dom::Utils::ValueToType<AZ::PointerObject>(value.value()); valueToPointerObject)
+                else if (auto valueToPointerObject = AZ::Dom::Utils::ValueToType<AZ::PointerObject>(value.value()); valueToPointerObject && valueToPointerObject->IsValid())
                 {
                     if (valueToPointerObject->m_typeId == m_proxyClassData.m_typeId)
                     {
@@ -390,7 +400,11 @@ namespace AzToolsFramework
                     {
                         const AZ::SerializeContext::ClassData* pointerClassData =
                             serializeContext != nullptr ? serializeContext->FindClassData(valueToPointerObject->m_typeId) : nullptr;
-                        if (pointerClassData != nullptr && pointerClassData->m_azRtti != nullptr)
+
+                        auto proxyClassData = serializeContext->FindClassData(m_proxyClassData.m_typeId);
+
+                        if (pointerClassData != nullptr && pointerClassData->m_azRtti != nullptr &&
+                            pointerClassData->m_azRtti->IsTypeOf<WrappedType>())
                         {
                             if (auto castInstance = pointerClassData->m_azRtti->Cast<WrappedType>(valueToPointerObject->m_address); castInstance != nullptr)
                             {
@@ -399,27 +413,27 @@ namespace AzToolsFramework
                                 typeId = valueToPointerObject->m_typeId;
                             }
                         }
+                        else if (proxyClassData != nullptr && proxyClassData->CanConvertFromType(valueToPointerObject->m_typeId, *serializeContext))
+                        {
+                            // Otherwise attempt to check if the proxy value is convertible to the TypeId type
+                            // such as for the case of an AZ::Data::Asset<T> from an AZ::Data::Asset<AZ::Data::AssetData>
+                            typeId = valueToPointerObject->m_typeId;
+                            m_proxyValue = *reinterpret_cast<WrappedType*>(valueToPointerObject->m_address);
+                        }
                     }
                 }
             }
 
+            if (typeId.IsNull() && value.has_value())
+            {
+                typeId = AZ::Dom::Utils::GetValueTypeId(value.value());
+            }
+
             // Set the m_genericClassInfo (if any) for our type in case the property handler needs to access it
             // when downcasting to the generic type (e.g. for asset property downcasting to the generic AZ::Data::Asset<AZ::Data::AssetData>)
-            if (typeId.IsNull())
+            if (!typeId.IsNull())
             {
-                auto typeIdAttribute = node.FindMember(PropertyEditor::ValueType.GetName());
-                if (typeIdAttribute != node.MemberEnd())
-                {
-                    typeId = AZ::Dom::Utils::DomValueToTypeId(typeIdAttribute->second);
-                }
-                else if (value.has_value())
-                {
-                    typeId = AZ::Dom::Utils::GetValueTypeId(value.value());
-                }
-                if (!typeId.IsNull())
-                {
-                    m_proxyClassElement.m_genericClassInfo = serializeContext->FindGenericClassInfo(typeId);
-                }
+                m_proxyClassElement.m_genericClassInfo = serializeContext->FindGenericClassInfo(typeId);
             }
 
             if (m_widget)
@@ -852,13 +866,36 @@ namespace AzToolsFramework
             const AZ::Uuid& actualUUID = node->GetClassMetadata()->m_typeId;
             const AZ::Uuid& desiredUUID = GetHandledType();
 
+            AZ::SerializeContext* serializeContext{};
+            if (auto componentApplicationRequests = AZ::Interface<AZ::ComponentApplicationRequests>::Get();
+                componentApplicationRequests != nullptr)
+            {
+                serializeContext = componentApplicationRequests->GetSerializeContext();
+            }
+
+            if (serializeContext == nullptr)
+            {
+                return;
+            }
+
+            auto desiredClassData = serializeContext->FindClassData(desiredUUID);
+
             for (size_t idx = 0; idx < node->GetNumInstances(); ++idx)
             {
                 void* instanceData = node->GetInstance(idx);
 
                 PropertyType* actualCast = CastTo(instanceData, node, actualUUID, desiredUUID);
+
+                // Check to see if the type supports an IDataConverter for Asset<T> types
+                // in case CastTo fails
+                if (actualCast == nullptr && desiredClassData != nullptr && desiredClassData->CanConvertFromType(actualUUID, *serializeContext))
+                {
+                    void* convertibleInstance{};
+                    desiredClassData->ConvertFromType(convertibleInstance, actualUUID, instanceData, *serializeContext);
+                    actualCast = reinterpret_cast<PropertyType*>(convertibleInstance);
+                }
                 AZ_Assert(actualCast, "Could not cast from the existing type ID to the actual typeid required by the editor.");
-                if (!ReadValuesIntoGUI(idx, wid, *actualCast, node))
+                if (actualCast == nullptr || !ReadValuesIntoGUI(idx, wid, *actualCast, node))
                 {
                     return;
                 }

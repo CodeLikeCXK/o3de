@@ -1501,6 +1501,8 @@ namespace ScriptCanvasEditor
         {
             AZ_Warning("Script Canvas", createOutcome, "%s", createOutcome.GetError().data());
         }
+
+        EnableOpenDocumentActions(true);
     }
 
     int MainWindow::InsertTabForAsset(AZStd::string_view assetPath, SourceHandle assetId, int tabIndex)
@@ -1833,6 +1835,13 @@ namespace ScriptCanvasEditor
         UpdateAssignToSelectionState();
 
         OnSaveToast toast(tabName, GetActiveGraphCanvasGraphId(), saveSuccess);
+
+        // If we are in the process of closing tabs, resume closing
+        if (m_isClosingTabs)
+        {
+            CloseNextTab();
+        }
+
         return memoryAsset;
     }
 
@@ -4101,16 +4110,25 @@ namespace ScriptCanvasEditor
 
         if (usableRequestBus == nullptr)
         {
-            AzToolsFramework::EntityCompositionRequestBus::Broadcast(&EntityCompositionRequests::AddComponentsToEntities, AzToolsFramework::EntityIdList{ entityId }
+            AzToolsFramework::EntityCompositionRequests::AddComponentsOutcome outcome;
+            AzToolsFramework::EntityCompositionRequestBus::BroadcastResult(outcome, &EntityCompositionRequests::AddComponentsToEntities, AzToolsFramework::EntityIdList{ entityId }
                                                                                                                         , AZ::ComponentTypeList{ azrtti_typeid<EditorScriptCanvasComponent>() });
 
-            usableRequestBus = EditorScriptCanvasComponentRequestBus::FindFirstHandler(entityId);
+            if (outcome.IsSuccess())
+            {
+                auto& addedComponent = outcome.GetValue()[entityId].m_componentsAdded[0];
+                AZ_Assert(addedComponent->GetUnderlyingComponentType() == azrtti_typeid<EditorScriptCanvasComponent>(), "Added component returned was not the type requested to add");
+
+                if (EditorScriptCanvasComponent* editorComponent = azrtti_cast<EditorScriptCanvasComponent*>(addedComponent))
+                {
+                    SourceHandle focusedAssetId = m_tabBar->FindAssetId(m_tabBar->currentIndex());
+
+                    AZ::Data::AssetId assetId = static_cast<AZ::Data::AssetId>(focusedAssetId.Id());
+                    editorComponent->SetPrimaryAsset(assetId);
+                }
+            }
         }
 
-        if (usableRequestBus)
-        {
-            usableRequestBus->SetAssetId(m_activeGraph.Describe());
-        }
     }
 
     bool MainWindow::HasSystemTickAction(SystemTickActionFlag action)

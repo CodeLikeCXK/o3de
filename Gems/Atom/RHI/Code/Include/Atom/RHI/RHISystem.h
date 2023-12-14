@@ -64,6 +64,8 @@ namespace AZ::RHI
         //////////////////////////////////////////////////////////////////////////
         // RHISystemInterface Overrides
         RHI::Device* GetDevice(int deviceIndex = MultiDevice::DefaultDeviceIndex) override;
+        //! Add a new virtual device (referencing the same physical device as an existing device marked by deviceIndexToVirtualize)
+        [[nodiscard]] AZStd::optional<int> AddVirtualDevice(int deviceIndexToVirtualize = MultiDevice::DefaultDeviceIndex) override;
         int GetDeviceCount() override;
         RHI::DrawListTagRegistry* GetDrawListTagRegistry() override;
         RHI::PipelineStateCache* GetPipelineStateCache() override;
@@ -73,6 +75,8 @@ namespace AZ::RHI
         ConstPtr<PlatformLimitsDescriptor> GetPlatformLimitsDescriptor(int deviceIndex = MultiDevice::DefaultDeviceIndex) const override;
         void QueueRayTracingShaderTableForBuild(RayTracingShaderTable* rayTracingShaderTable) override;
         XRRenderingInterface* GetXRSystem() const override;
+        void SetDrawListTagEnabledByDefault(DrawListTag drawListTag, bool enabled) override;
+        const AZStd::vector<DrawListTag>& GetDrawListTagsDisabledByDefault() const override;
         //////////////////////////////////////////////////////////////////////////
 
         //////////////////////////////////////////////////////////////////////////
@@ -95,6 +99,7 @@ namespace AZ::RHI
         //! Enumerates the Physical devices and picks one (or multiple) to be used to initialize the RHI::Device(s) with
         ResultCode InitInternalDevices(InitDevicesFlags initializationVariant);
 
+        AZStd::vector<DrawListTag> m_drawListTagsDisabledByDefault;
         AZStd::vector<RHI::Ptr<RHI::Device>> m_devices;
         RHI::FrameScheduler m_frameScheduler;
         RHI::FrameSchedulerCompileRequest m_compileRequest;
